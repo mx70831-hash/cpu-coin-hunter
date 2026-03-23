@@ -30,6 +30,16 @@ DATA_DIR.mkdir(exist_ok=True)
 
 KNOWN_DB = DATA_DIR / "known_projects.json"
 
+# X/Twitter 搜索关键词
+X_SEARCH_QUERIES = [
+    "cpu mining new coin",
+    "cpu mineable fair launch",
+    "randomx new coin launch",
+    "yespower new coin",
+    "cpu mining cryptocurrency launch",
+    "cpu pow coin launch",
+]
+
 # CPU 相关关键词
 CPU_KEYWORDS = [
     "cpu", "randomx", "cryptonight", "yespower", "yescrypt",
@@ -70,6 +80,101 @@ def fetch_json(url, headers=None):
         except json.JSONDecodeError:
             return None
     return None
+
+
+# ========== SOURCE 0: X/Twitter ==========
+
+def scan_x_twitter():
+    """扫描 X/Twitter 上的 CPU 挖矿新币信息.
+    
+    通过 X Syndication API（无需登录）获取已知矿币账号和搜索结果。
+    """
+    print("[1/4] Scanning X/Twitter for CPU mining coins...")
+    results = []
+    seen = set()
+
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+
+    # 已知 CPU 矿币项目的 X 账号
+    cpu_mining_accounts = [
+        # 成熟项目
+        "DeroProject", "getmonero", "Raptoreum", "EpicCashTech",
+        "ZephyrProtocol", "VerusCoin", "taboroietwork", "ZanoProject",
+        # 新项目（从 BitcoinTalk 发现的）
+        "FairchainDev", "fairchain_io", "BotchainCoin", "botchain_io",
+        "DilithionCoin", "BasecoinDev", "BitMoneroCoin",
+        "TaronNetwork", "ObiDogeCoin", "SmartieCoin",
+        "c64chain", "CatCoinDev", "WaecnanChain", "LuckyPepeCoin",
+        # 挖矿信息聚合
+        "cpumininginfo", "MiningPoolStats", "WhatToMine",
+    ]
+
+    for account in cpu_mining_accounts:
+        try:
+            url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{account}"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                page = resp.read().decode("utf-8", errors="replace")
+
+            # 提取 JSON
+            json_match = re.search(
+                r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', page, re.DOTALL
+            )
+            if not json_match:
+                continue
+
+            import html as html_lib
+            data = json.loads(json_match.group(1))
+            timeline = data.get("props", {}).get("pageProps", {}).get("timeline", {})
+            entries = timeline.get("entries", [])
+
+            if not entries:
+                continue
+
+            # 只看最近的推文
+            for entry in entries[:5]:
+                content = entry.get("content", {})
+                tweet = content.get("tweet", content)
+                text = tweet.get("text", "")
+                tweet_id = tweet.get("id_str", "")
+                created = tweet.get("created_at", "")
+
+                if not text:
+                    continue
+
+                # 检查是否与 CPU 挖矿/新币相关
+                text_lower = text.lower()
+                is_relevant = any(kw in text_lower for kw in [
+                    "cpu", "mining", "mine", "miner", "launch", "mainnet",
+                    "new coin", "fair launch", "randomx", "yespower",
+                    "pow", "block reward", "halving", "hashrate",
+                    "testnet", "node", "wallet", "pool",
+                ])
+
+                if is_relevant and tweet_id not in seen:
+                    seen.add(tweet_id)
+                    clean_text = html_lib.unescape(text)[:200]
+                    results.append({
+                        "source": "x_twitter",
+                        "username": account,
+                        "tweet_id": tweet_id,
+                        "url": f"https://x.com/{account}/status/{tweet_id}" if tweet_id else f"https://x.com/{account}",
+                        "text": clean_text,
+                        "snippet": clean_text,
+                        "title": f"@{account}",
+                        "created_at": created,
+                        "search_query": "syndication_api",
+                    })
+
+        except Exception:
+            continue  # 静默跳过失败的账号
+
+        time.sleep(0.5)  # 限速
+
+    # 按时间排序（最新的在前）
+    results.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    print(f"    Found {len(results)} X/Twitter mentions")
+    return results
 
 
 # ========== SOURCE 1: BitcoinTalk ANN ==========
@@ -289,7 +394,7 @@ def load_known_projects():
     if KNOWN_DB.exists():
         with open(KNOWN_DB) as f:
             return json.load(f)
-    return {"bitcointalk_topics": [], "github_repos": [], "whattomine_symbols": [], "last_updated": ""}
+    return {"bitcointalk_topics": [], "github_repos": [], "whattomine_symbols": [], "x_tweet_ids": [], "last_updated": ""}
 
 
 def save_known_projects(known):
@@ -298,14 +403,22 @@ def save_known_projects(known):
         json.dump(known, f, indent=2, ensure_ascii=False)
 
 
-def find_new_projects(btt_results, gh_results, wtm_results, known):
+def find_new_projects(x_results, btt_results, gh_results, wtm_results, known):
+    known_tweet_ids = set(known.get("x_tweet_ids", []))
+    new_x = [r for r in x_results if r.get("tweet_id") and r["tweet_id"] not in known_tweet_ids]
+    # 对于没有 tweet_id 的（账号级别），用 username 去重
+    known_usernames = {r.get("username") for r in x_results if r.get("tweet_id") in known_tweet_ids}
+    new_x += [r for r in x_results if not r.get("tweet_id") and r.get("username") not in known_usernames]
     new_btt = [r for r in btt_results if r["topic_id"] not in known["bitcointalk_topics"]]
     new_gh = [r for r in gh_results if r["name"] not in known["github_repos"]]
     new_wtm = [r for r in wtm_results if r["symbol"] not in known["whattomine_symbols"]]
-    return new_btt, new_gh, new_wtm
+    return new_x, new_btt, new_gh, new_wtm
 
 
-def update_known(btt_results, gh_results, wtm_results, known):
+def update_known(x_results, btt_results, gh_results, wtm_results, known):
+    known["x_tweet_ids"] = list(set(
+        known.get("x_tweet_ids", []) + [r["tweet_id"] for r in x_results if r.get("tweet_id")]
+    ))
     known["bitcointalk_topics"] = list(set(
         known["bitcointalk_topics"] + [r["topic_id"] for r in btt_results]
     ))
@@ -320,11 +433,11 @@ def update_known(btt_results, gh_results, wtm_results, known):
 
 # ========== 报告 ==========
 
-def format_report(date_str, new_btt, new_gh, new_wtm, all_btt, all_gh, all_wtm, is_first_run):
+def format_report(date_str, new_x, new_btt, new_gh, new_wtm, all_x, all_btt, all_gh, all_wtm, is_first_run):
     lines = []
     lines.append(f"⛏️ CPU 新币猎手报告 - {date_str}")
     lines.append(f"扫描时间: {datetime.now().strftime('%H:%M:%S')}")
-    lines.append(f"数据源: BitcoinTalk ANN + GitHub + WhatToMine")
+    lines.append(f"数据源: X/Twitter + BitcoinTalk ANN + GitHub + WhatToMine")
     lines.append("")
 
     if is_first_run:
@@ -332,9 +445,16 @@ def format_report(date_str, new_btt, new_gh, new_wtm, all_btt, all_gh, all_wtm, 
         lines.append("")
 
     # === 新发现 ===
-    total_new = len(new_btt) + len(new_gh) + len(new_wtm)
+    total_new = len(new_x) + len(new_btt) + len(new_gh) + len(new_wtm)
     if total_new > 0:
         lines.append(f"🆕 ===== 新发现项目: {total_new} 个 =====")
+        lines.append("")
+
+    if new_x:
+        lines.append("🐦 X/Twitter 新动态:")
+        for r in new_x:
+            lines.append(f"  • @{r['username']}: {r['snippet'][:120]}")
+            lines.append(f"    {r['url']}")
         lines.append("")
 
     if new_btt:
@@ -373,6 +493,7 @@ def format_report(date_str, new_btt, new_gh, new_wtm, all_btt, all_gh, all_wtm, 
 
     # === 汇总 ===
     lines.append("📊 ===== 汇总 =====")
+    lines.append(f"X/Twitter 动态: {len(all_x)} 条")
     lines.append(f"BitcoinTalk CPU 相关帖子: {len(all_btt)} 个")
     lines.append(f"GitHub CPU 挖矿项目: {len(all_gh)} 个")
     lines.append(f"WhatToMine CPU 币种: {len(all_wtm)} 个")
@@ -395,21 +516,22 @@ def main():
     known = load_known_projects()
     is_first_run = not known["last_updated"]
 
-    # 扫描三个数据源
+    # 扫描四个数据源
+    x_results = scan_x_twitter()
     btt_results = scan_bitcointalk()
     gh_results = scan_github()
     wtm_results = scan_whattomine()
 
     # 发现新项目
-    new_btt, new_gh, new_wtm = find_new_projects(btt_results, gh_results, wtm_results, known)
+    new_x, new_btt, new_gh, new_wtm = find_new_projects(x_results, btt_results, gh_results, wtm_results, known)
 
     # 更新已知库
-    known = update_known(btt_results, gh_results, wtm_results, known)
+    known = update_known(x_results, btt_results, gh_results, wtm_results, known)
     save_known_projects(known)
 
     # 生成报告
-    report_text = format_report(date_str, new_btt, new_gh, new_wtm,
-                                 btt_results, gh_results, wtm_results, is_first_run)
+    report_text = format_report(date_str, new_x, new_btt, new_gh, new_wtm,
+                                 x_results, btt_results, gh_results, wtm_results, is_first_run)
     print(f"\n{report_text}")
 
     # 保存
@@ -417,9 +539,11 @@ def main():
         "date": date_str,
         "scan_time": datetime.now().isoformat(),
         "is_first_run": is_first_run,
+        "new_x_twitter": new_x,
         "new_bitcointalk": new_btt,
         "new_github": new_gh,
         "new_whattomine": new_wtm,
+        "all_x_twitter": x_results,
         "all_bitcointalk": btt_results,
         "all_github": gh_results,
         "all_whattomine": wtm_results,
@@ -435,7 +559,7 @@ def main():
     print(f"\n[+] Saved: {json_path}")
     print(f"[+] Saved: {text_path}")
 
-    total_new = len(new_btt) + len(new_gh) + len(new_wtm)
+    total_new = len(new_x) + len(new_btt) + len(new_gh) + len(new_wtm)
     if total_new > 0:
         print(f"\n🚨 发现 {total_new} 个新项目！")
 
