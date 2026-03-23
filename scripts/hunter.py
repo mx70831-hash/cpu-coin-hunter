@@ -166,6 +166,67 @@ def scan_github():
             is_mining = any(kw in combined for kw in MINING_KEYWORDS)
 
             if is_cpu or is_mining:
+                # 安全检查：分析仓库内容
+                risk_flags = []
+                trust_score = 5  # 满分10
+
+                # 没有源码语言 → 可能只有二进制
+                if not repo.get("language"):
+                    risk_flags.append("⚠️ 无源码语言(可能仅含二进制)")
+                    trust_score -= 3
+
+                # 0 星 0 fork → 全新无人验证
+                if repo["stargazers_count"] == 0 and repo["forks_count"] == 0:
+                    risk_flags.append("⚠️ 零星零fork(无人验证)")
+                    trust_score -= 1
+
+                # 检查是否有可疑文件（通过 API 查看仓库内容）
+                contents_url = f"https://api.github.com/repos/{full_name}/contents"
+                contents = fetch_json(contents_url, headers={"Accept": "application/vnd.github.v3+json"})
+                has_source = False
+                has_binary_only = False
+                exe_count = 0
+                source_count = 0
+                if contents and isinstance(contents, list):
+                    source_exts = {".py", ".go", ".rs", ".c", ".cpp", ".h", ".js", ".ts", ".sol", ".java", ".cs"}
+                    binary_exts = {".exe", ".dll", ".bin", ".msi", ".dmg", ".app"}
+                    for item in contents:
+                        name_l = item.get("name", "").lower()
+                        for ext in source_exts:
+                            if name_l.endswith(ext):
+                                source_count += 1
+                                has_source = True
+                        for ext in binary_exts:
+                            if name_l.endswith(ext):
+                                exe_count += 1
+                        # 检查 src/ 或常见源码目录
+                        if item.get("type") == "dir" and item.get("name", "").lower() in ["src", "lib", "cmd", "pkg", "internal"]:
+                            has_source = True
+                            source_count += 1
+
+                    if exe_count > 0 and not has_source:
+                        has_binary_only = True
+                        risk_flags.append("🚨 仅含二进制文件(无源码!高风险)")
+                        trust_score -= 4
+                    elif exe_count > 0 and has_source:
+                        risk_flags.append("⚠️ 含预编译二进制+源码")
+                        trust_score -= 1
+
+                # 账户太新也是风险
+                # (通过 owner 信息判断)
+                owner = repo.get("owner", {})
+                if owner.get("type") == "User":
+                    owner_url = f"https://api.github.com/users/{owner.get('login','')}"
+                    owner_info = fetch_json(owner_url, headers={"Accept": "application/vnd.github.v3+json"})
+                    if owner_info:
+                        public_repos = owner_info.get("public_repos", 0)
+                        followers = owner_info.get("followers", 0)
+                        if public_repos <= 1 and followers == 0:
+                            risk_flags.append("⚠️ 新账户(仅1个仓库,0粉丝)")
+                            trust_score -= 1
+
+                trust_score = max(0, min(10, trust_score))
+
                 results.append({
                     "source": "github",
                     "name": repo["full_name"],
@@ -177,6 +238,11 @@ def scan_github():
                     "updated_at": repo["updated_at"],
                     "language": repo.get("language", ""),
                     "topics": repo.get("topics", []),
+                    "risk_flags": risk_flags,
+                    "trust_score": trust_score,
+                    "has_binary_only": has_binary_only,
+                    "exe_count": exe_count,
+                    "source_count": source_count,
                 })
 
         time.sleep(1)  # GitHub rate limit
@@ -282,9 +348,16 @@ def format_report(date_str, new_btt, new_gh, new_wtm, all_btt, all_gh, all_wtm, 
     if new_gh:
         lines.append("💻 GitHub 新项目:")
         for r in new_gh:
-            lines.append(f"  • {r['name']} ⭐{r['stars']} ({r['language'] or 'N/A'})")
-            lines.append(f"    {r['description'][:100]}" if r['description'] else "")
+            trust = r.get('trust_score', '?')
+            trust_icon = "🟢" if trust >= 7 else "🟡" if trust >= 4 else "🔴"
+            binary_warn = " 🚨仅二进制!" if r.get('has_binary_only') else ""
+            lines.append(f"  • {trust_icon} {r['name']} ⭐{r['stars']} ({r['language'] or 'N/A'}) [信任:{trust}/10]{binary_warn}")
+            if r.get('description'):
+                lines.append(f"    {r['description'][:100]}")
             lines.append(f"    创建: {r['created_at'][:10]} | {r['url']}")
+            if r.get('risk_flags'):
+                for flag in r['risk_flags']:
+                    lines.append(f"    {flag}")
         lines.append("")
 
     if new_wtm:
